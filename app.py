@@ -13,16 +13,14 @@ def get_kst():
 
 now_kst = get_kst()
 
-# 2. 데이터 로드 및 컬럼명 자동 세척 (수량 에러 방지)
+# 2. 데이터 로드 및 컬럼명 자동 세척
 @st.cache_data(ttl=60)
 def load_data_robust(sheet_name):
-    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&sheet={sheet_name}"
     try:
         df = pd.read_csv(url)
-        # 컬럼명 앞뒤 공백 제거 및 문자열화 (수량 에러 해결 핵심)
         df.columns = [str(col).strip() for col in df.columns]
-        df = df.dropna(how='all') 
-        return df
+        return df.dropna(how='all') 
     except:
         return pd.DataFrame()
 
@@ -43,13 +41,10 @@ try:
     assets_df = load_data_robust("assets")
     history_df = load_data_robust("history")
 
-    # 3. 최상단 타이틀 (경호님 요청 반영)
+    # 3. 최상단 타이틀 및 글로벌 지표
     st.title("🛰️ 경호 & 수진 통합 자산 관제탑")
-    st.caption(f"기준 시각(KST): {now_kst.strftime('%Y-%m-%d %H:%M:%S')} | 10년 경제적 자유 프로젝트")
+    st.caption(f"📍 한국 표준시: {now_kst.strftime('%Y-%m-%d %H:%M:%S')} | 자산 규모 확장 반영 버전")
 
-    st.divider()
-
-    # 4. 글로벌 시장 지표 (간지 섹션)
     indices = {"S&P 500": "^GSPC", "나스닥": "^IXIC", "코스피": "^KS11", "환율(USD/KRW)": "USDKRW=X", "금(Gold)": "GC=F"}
     m_cols = st.columns(len(indices))
     usd_krw = 1450.0
@@ -60,26 +55,22 @@ try:
 
     st.divider()
 
-    # 5. 실시간 자산 계산 (수량 기반)
-    # [방어 코드] 수량 컬럼 존재 확인
-    if '수량' not in assets_df.columns:
-        st.error(f"⚠️ '수량' 컬럼을 찾을 수 없습니다. 현재 인식된 컬럼: {list(assets_df.columns)}")
+    # 4. 실시간 자산 계산
+    if '수량' in assets_df.columns:
+        assets_df['수량'] = pd.to_numeric(assets_df['수량'], errors='coerce').fillna(0)
+        def calc_live_val(row):
+            t, q, unit = str(row.get('티커', '-')).strip(), row['수량'], str(row.get('통화', 'KRW')).strip()
+            if t == "-" or not t or t == "nan": return q
+            p, _ = get_market_data(t)
+            return p * q * (usd_krw if unit == "USD" else 1.0)
+        assets_df['평가금액'] = assets_df.apply(calc_live_val, axis=1)
+        raw_total = assets_df['평가금액'].sum()
+    else:
+        st.error("시트에서 '수량' 컬럼을 찾을 수 없습니다.")
         st.stop()
-    
-    assets_df['수량'] = pd.to_numeric(assets_df['수량'], errors='coerce').fillna(0)
-    
-    def calc_live_val(row):
-        t, q, unit = str(row.get('티커', '-')).strip(), row['수량'], str(row.get('통화', 'KRW')).strip()
-        if t == "-" or not t or t == "nan": return q
-        p, _ = get_market_data(t)
-        return p * q * (usd_krw if unit == "USD" else 1.0)
 
-    assets_df['평가금액'] = assets_df.apply(calc_live_val, axis=1)
-    raw_total = assets_df['평가금액'].sum()
-
-    # --- [섹션 1: 지출 입력 및 순자산 계산] ---
-    with st.expander("💸 오늘자 지출 입력 및 실시간 순자산 정산", expanded=True):
-        st.write("### 1. 지출 내역")
+    # 5. 지출 입력 및 정산 (메인 섹션)
+    with st.expander("💸 오늘자 지출 입력 및 순자산 정산", expanded=True):
         e_c1, e_c2, e_c3 = st.columns(3)
         v1 = e_c1.number_input("🏠 고정지출", value=0)
         v2 = e_c2.number_input("🤴 경호용돈", value=0)
@@ -92,13 +83,11 @@ try:
         net_total = raw_total - total_exp
         rec_date = st.date_input("기록 날짜", now_kst)
         
-        st.divider()
         m1, m2, m3 = st.columns(3)
         m1.metric("실시간 자산합계", f"₩{raw_total:,.0f}")
         m2.metric("오늘 총 지출", f"- ₩{total_exp:,.0f}")
         m3.metric("기록될 순자산(A-B)", f"₩{net_total:,.0f}")
 
-        # 저장 기능 (에러 시 복사용 텍스트 제공)
         if st.button("🚀 순자산 데이터 저장"):
             try:
                 from streamlit_gsheets import GSheetsConnection
@@ -114,7 +103,7 @@ try:
 
     st.divider()
 
-    # --- [섹션 2: 시각화 리포트] ---
+    # 6. 시각화 (Y축 스케일 개선)
     col_pie, col_flow = st.columns([1, 1.2])
     
     with col_pie:
@@ -125,17 +114,25 @@ try:
         
     with col_flow:
         if not history_df.empty:
-            st.subheader("📈 자산 성장 곡선 (만원 단위)")
+            st.subheader("📈 순자산 성장 곡선")
             history_df['날짜'] = pd.to_datetime(history_df['날짜'])
             history_df = history_df.sort_values('날짜')
-            history_df['총자산_만원'] = (pd.to_numeric(history_df['총자산'], errors='coerce').fillna(0) / 10000).round(0)
             
-            fig_t = px.line(history_df, x='날짜', y='총자산_만원', markers=True)
-            fig_t.update_xaxes(type='date', tickformat="%m/%d")
-            fig_t.update_yaxes(ticksuffix="만")
+            # [수정] 자산액이 크므로 '만원' 단위로 변환하되, Y축에 콤마 표시
+            history_df['총자산_만원'] = (pd.to_numeric(history_df['총자산'], errors='coerce').fillna(0) / 10000)
+            
+            fig_t = px.line(history_df, x='날짜', y='총자산_만원', markers=True, 
+                            labels={'총자산_만원': '순자산(만원)'})
+            
+            # Y축 눈금을 더 촘촘하고 크게 표시
+            fig_t.update_yaxes(tickformat=",d", ticksuffix="만")
+            
+            # [선택 사항] 1차 목표선 추가 (예: 5억 원)
+            fig_t.add_hline(y=50000, line_dash="dash", line_color="red", annotation_text="1차 목표(5억)")
+            
             st.plotly_chart(fig_t, use_container_width=True)
 
-    # --- [섹션 3: 자산 명세서] ---
+    # 7. 상세 명세
     st.subheader("📋 실시간 상세 명세")
     assets_df['비중(%)'] = (assets_df['평가금액'] / raw_total * 100).round(1)
     st.dataframe(assets_df[['카테고리', '종목명', '수량', '평가금액', '비중(%)']], use_container_width=True, hide_index=True)
