@@ -1,89 +1,78 @@
 import streamlit as st
-import pandas as pd
+from streamlit_gsheets import GSheetsConnection
 import yfinance as yf
+import pandas as pd
 import plotly.express as px
-import time
+from datetime import datetime
 
-# 1. 앱 설정
+# 1. 페이지 설정
 st.set_page_config(layout="wide", page_title="경호 자산 관제탑")
 
-# 2. 구글 시트 데이터 로드 (캐시 적용 - 10분 동안 유지)
-@st.cache_data(ttl=600)
-def get_google_data(url):
-    try:
-        if "/d/" in url:
-            sheet_id = url.split("/d/")[1].split("/")[0]
-            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-            df = pd.read_csv(csv_url)
-            df.columns = df.columns.str.strip()
-            return df
-    except Exception as e:
-        st.error(f"시트 로드 실패: {e}")
-        return None
+# 2. 구글 시트 연결
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-# 3. 실시간 가격 가져오기 (에러 방어 로직 추가)
-@st.cache_data(ttl=300) # 가격은 5분마다 갱신
-def fetch_price(ticker):
-    if ticker == "-" or ticker == "nan" or not isinstance(ticker, str):
-        return 1.0
-    try:
-        # 야후 파이낸스 요청 (에러 나면 루프 돌지 않게 단발성으로)
-        data = yf.download(ticker, period="1d", interval="1m", progress=False)
-        if not data.empty:
-            return float(data['Close'].iloc[-1])
-        return 0.0
-    except Exception:
-        # Rate Limit 걸리면 0을 반환해서 앱이 멈추지 않게 함
-        return 0.0
+# 3. 데이터 불러오기
+assets_df = conn.read(worksheet="assets")
+history_df = conn.read(worksheet="history")
 
-# 4. 실행 로직
-try:
-    raw_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
-    df = get_google_data(raw_url)
+# 4. 실시간 가격 반영 및 총자산 계산
+@st.cache_data(ttl=300)
+def get_price(ticker):
+    if ticker == "-" or pd.isna(ticker): return 1.0
+    try:
+        p = yf.download(ticker, period="1d", progress=False)['Close'].iloc[-1]
+        return float(p)
+    except: return 0.0
+
+usd_krw = get_price("USDKRW=X")
+if usd_krw <= 1.0: usd_krw = 1450.0 # 환율 에러 방지
+
+# 실시간 총자산 계산 (경호님이 원하신 기능)
+def calc_total():
+    temp_df = assets_df.copy()
+    temp_df['평가금액'] = temp_df.apply(lambda r: get_price(str(r['티커']).strip()) * r['수량'] * (usd_krw if r['통화']=="USD" else 1.0) if str(r['티커']).strip() != "-" else r['수량'], axis=1)
+    return temp_df['평가금액'].sum(), temp_df
+
+current_total, final_assets = calc_total()
+
+# --- 화면 구성 ---
+st.header(f"🛰️ 경호&와이프 자산 관제탑")
+
+col1, col2, col3 = st.columns(3)
+col1.metric("현재 총 자산", f"₩{current_total:,.0f}")
+col2.metric("실시간 환율", f"₩{usd_krw:,.2f}")
+col3.write(f"**마지막 업데이트:** {datetime.now().strftime('%H:%M:%S')}")
+
+st.divider()
+
+# --- 자동 기록 섹션 ---
+with st.expander("📝 이번 달 기록장 (자동 계산)", expanded=True):
+    col_a, col_b = st.columns(2)
+    record_date = col_a.date_input("기록 기준일", datetime.now())
+    monthly_spend = col_b.number_input("이번 달 지출액(원)", value=0, step=10000)
     
-    if df is not None:
-        # 환율 가져오기 (실패 시 기본값 1400원 설정)
-        usd_krw = fetch_price("USDKRW=X")
-        if usd_krw == 0: usd_krw = 1450.0 # 야후 차단 시 임시 환율
-        
-        # 전체 자산 평가
-        processed = []
-        for _, row in df.iterrows():
-            ticker = str(row['티커']).strip()
-            qty = float(row['수량'])
-            unit = str(row['통화']).strip()
-            
-            # 실시간 가격 시도
-            live_p = fetch_price(ticker)
-            
-            # 평가금액 계산
-            if ticker == "-": # 고정 자금
-                eval_krw = qty
-            elif live_p > 0: # 실시간 성공
-                eval_krw = live_p * qty * (usd_krw if unit == "USD" else 1.0)
-            else: # 실시간 실패 시 (안내 메시지용)
-                eval_krw = 0 # 일단 0으로 표기
-            
-            processed.append([row['카테고리'], row['종목명'], qty, live_p, eval_krw])
-        
-        res_df = pd.DataFrame(processed, columns=["카테고리", "종목명", "수량", "현재가", "평가금액"])
-        total_val = res_df["평가금액"].sum()
-        
-        # 화면 출력
-        st.header(f"🛰️ 경호&와이프 자산 관제탑")
-        c1, c2 = st.columns(2)
-        c1.metric("총 순자산", f"₩{total_val:,.0f}")
-        c2.metric("실시간 환율(적용)", f"₩{usd_krw:,.2f}")
-        
-        if any(res_df["현재가"] == 0):
-            st.warning("⚠️ 야후 파이낸스 접속량이 많아 일부 가격을 불러오지 못했습니다. 잠시 후 새로고침하세요.")
+    if st.button("🚀 현재 자산 실시간 데이터로 기록하기"):
+        # 새로운 기록 데이터 생성
+        new_record = pd.DataFrame([{
+            "날짜": record_date.strftime("%Y-%m-%d"),
+            "총자산": int(current_total),
+            "지출": monthly_spend
+        }])
+        # 기존 기록에 합치기
+        updated_history = pd.concat([history_df, new_record], ignore_index=True)
+        # 구글 시트에 업데이트
+        conn.update(worksheet="history", data=updated_history)
+        st.success(f"✅ {record_date} 자산 ₩{current_total:,.0f} 기록 완료!")
+        st.rerun()
 
-        st.dataframe(res_df, use_container_width=True, hide_index=True)
-        
-        # 차트
-        fig = px.pie(res_df, values='평가금액', names='카테고리', hole=0.4,
-                     color_discrete_map={'① 핵심':'#3498db','② 위성':'#e67e22','③ 안전':'#2ecc71'})
-        st.plotly_chart(fig, use_container_width=True)
+# --- 자산 추이 그래프 ---
+if history_df is not None and not history_df.empty:
+    st.subheader("📈 자산 및 지출 히스토리")
+    history_df['날짜'] = pd.to_datetime(history_df['날짜'])
+    fig = px.line(history_df.sort_values('날짜'), x='날짜', y='총자산', markers=True, title="자산 성장 곡선")
+    st.plotly_chart(fig, use_container_width=True)
 
-except Exception as e:
-    st.error(f"설정 확인 필요: {e}")
+# --- 자산 명세서 ---
+st.subheader("📋 실시간 상세 명세")
+final_assets['비중(%)'] = (final_assets['평가금액'] / current_total * 100).round(1)
+st.dataframe(final_assets[['카테고리', '종목명', '수량', '평가금액', '비중(%)']], use_container_width=True, hide_index=True)
